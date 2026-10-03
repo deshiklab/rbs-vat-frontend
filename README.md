@@ -160,6 +160,196 @@ Next.js 15 (App Router) · React 19 · TypeScript · Tailwind v4 · shadcn/ui (B
   - **Tests:** `e2e_r66.py` (8 sections); contract 676 checks / 226 endpoints; `api_native.py` 95 checks;
     axe 0 violations / 288 runs (143 pages).
 
+- **R5.2 — Backend: the master data on real tables (branch `r5-nestjs`):** customers, vendors, items and master items
+  leave the compat layer and get their own PostgreSQL tables. See
+  [docs/BACKEND.md › R5.2](docs/BACKEND.md#r52--customers-and-vendors-on-their-own-table) (parties) and
+  [› items](docs/BACKEND.md#r52--items-and-master-items-on-their-own-table).
+  - **`parties`:** customers and vendors in one table (`kind` tells them apart), `ord` keeping each kind's insertion
+    order so lists tie-break exactly as they did in memory. The duplicate rules are enforced by the database too
+    (partial unique indexes per kind on the name and on the BIN with its `NID ` prefix ignored), and a race that slips
+    past the application check is still a 422.
+  - **Deleting is a `deleted_at` stamp**, so master data never leaves relational storage: the 10-second undo trash is
+    rebuilt from the table at boot, a deleted customer is still a row, and it is still in every backup.
+  - **`items` and `master_items`:** SKUs and the HS-code products they belong to, with the six movement counters an
+    item's `remain` is derived from as columns — so stock travels with its row. Unique by the database as well
+    (`lower(sku)`, `lower(name)`), a master item's rename carries its SKUs along in the same transaction (they quote
+    its name), and its tax profile is stored flat, like the tariff's own columns, so the two can be compared in SQL.
+  - **Documents still move those counters** (a sale approved, an opening entry, a damage note), so the write-back
+    saves what a compat handler changed and reads the stored row back into memory — a column type that rounds cannot
+    leave the two copies apart. The same path adopts a SKU the R6.2 bulk import creates.
+  - **The rules are shared, not copied:** the native handlers call the mock handlers' own functions (`partyRow`,
+    `partyErrors`, `normaliseParty`, `newPartyId`, `buildItem`, `masterErrors`, `masterRow` …) through the compat
+    bundle — the item and master-item rules were gathered into `src/app/api/v1/_items.ts` for exactly that, and the
+    mock's answers are byte-identical to before (58 request cases compared against the pre-refactor handlers). So the
+    PostgreSQL API, the Next.js mock and the GitHub Pages demo cannot drift: same responses, same 422/404/409 codes,
+    same audit events — and the party register's aggregates still come from the documents, which stay in
+    `compat_state` until R5.3.
+  - **Write-through both ways:** the in-memory copies the 88 unported route modules read are kept in step, and what a
+    compat handler writes — a party or SKU the R6.2 bulk import creates, a counter a document moves — is adopted into
+    the tables after its request.
+  - **Upgrading keeps the data:** the first boot after the migration moves the customers, vendors, items and master
+    items out of `compat_state` into their tables and rewrites the snapshot without them — no re-seed
+    (`SEED_VERSION` unchanged), so a customer installation and a restored pre-R5.2 backup both carry their records
+    over.
+  - **Tests:** `api_native.py` 147 checks (+52: rows in `parties`, `items` and `master_items`, none of those
+    collections left in the snapshot, the database refusing a duplicate party name and SKU, delete → `deleted_at` →
+    undo → still deleted after a restart, an undo whose name was taken again answering 422 instead of a 500 from the
+    unique index, a rename that reaches the SKU in the table, a compat document's counter and a compat import landing
+    in `items`, stock surviving a restart, a stale instance refusing native party and SKU writes during a deploy
+    overlap — and an **upgrade drill**: the database is rewritten into its pre-R5.2 shape, the API restarted, and the
+    same rows, the same four registers and a snapshot without the collections are required back). Contract unchanged:
+    676 checks / 226 endpoints.
+  - **Left for R5.3:** the stock ledger and branches' stock, which are *derived* from documents, become relational
+    with the documents themselves — R5.3 gives the first documents tables, and the derivation follows once every
+    movement family has one.
+
+- **R5.3 — Backend: the first documents on real tables (branch `r5-nestjs`):** stock transfers and damage entries
+  leave the compat layer for `stock_documents` + `stock_document_lines`, the sales invoices (Mushak 6.3) for
+  `sales` + `sale_lines` + `sale_realisations`, the purchases (local, service and import) for `purchases` +
+  `purchase_lines`, and the credit and debit notes (Mushak 6.7/6.8) for `notes` + `note_lines`. See
+  [docs/BACKEND.md › R5.3](docs/BACKEND.md#r53--stock-documents-on-their-own-tables) (stock documents),
+  [docs/BACKEND.md › R5.3](docs/BACKEND.md#r53--sales-invoices-on-their-own-tables) (sales invoices) and
+  [docs/BACKEND.md › R5.3](docs/BACKEND.md#r53--purchases-on-their-own-tables) (purchases) and
+  [docs/BACKEND.md › R5.3](docs/BACKEND.md#r53--credit-and-debit-notes-on-their-own-tables) (the notes).
+  - **One table for both kinds** (`kind` tells a transfer from a damage entry), because that is how the registers and
+    the branch-stock derivation read them. The branch a document consumes is `from_branch_id` for either kind — a
+    transfer's origin, a damage entry's own branch — and only a transfer has a destination. `ord` keeps the insertion
+    order the lists tie-break on, exactly as the in-memory arrays did.
+  - **Lines are rows, not JSON:** each carries its item, quantity and the unit cost at posting (`numeric(18,3)` /
+    `numeric(18,2)`), so what a movement carries can be summed in SQL instead of walked in memory. Editing a draft
+    replaces its lines in the same transaction, deleting a draft deletes them with it, and the document number
+    (`TR-MMYY####` / `DM-MMYY####`) is unique in the database as well — a race that slips past the application check
+    is a 409, not a 500.
+  - **An approval writes what it moves:** a damage entry's `items.damage` counter goes with the document, in its
+    transaction, and is taken back on cancellation; if the transaction fails, the in-memory counters are restored, so
+    the two copies cannot drift apart.
+  - **The rules are shared, not copied:** the native handlers call the mock handlers' own functions (`buildStock`,
+    `nextStockNo`, `approveDoc`, `cancelDoc`, `stockDocDiff`, `stockSpec`, `stockCsvColumns` …) through the compat
+    bundle — the stock rules were gathered into `src/app/api/v1/_stock.ts` for exactly that, and now return data
+    (field errors, a document's fields, a rejection's status and title) rather than a Web `Response`, so each side
+    makes its own response out of the same rules. Both sides were held against the same contract suite: 676 checks
+    with the routes served natively, and 676 again with the mock handlers serving them, so the port is behaviour for
+    behaviour and the Next.js mock and the GitHub Pages demo cannot drift.
+  - **The derived stock still reads every document:** the branch split (`stock`) and an item's ledger
+    (`items/{id}/ledger`) add up sales, purchases, credit and debit notes, opening entries and production batches as
+    well, so they stay derived in memory until those have tables too (R5.3–R5.4). A document written natively reaches
+    them at once — the module keeps the in-memory copies in step, and the write-back adopts whatever a compat handler
+    writes through the mock's arrays.
+  - **Upgrading keeps the data:** the first boot after each migration moves the stock documents out of
+    `compat_state` into their tables, and then the invoices with their lines and proceeds entries into theirs, and
+    rewrites the snapshot without them — no re-seed (`SEED_VERSION` unchanged), so a customer installation and a
+    restored pre-R5.3 backup both carry their documents over.
+  - **An invoice is three tables:** the header carries the money (`numeric(18,2)`), the quantities (`numeric(18,3)`)
+    and its own history (JSONB); `sale_lines` holds the printed lines in order (primary key `(sale, position)`), so an
+    edit replaces rows rather than a JSON array; `sale_realisations` holds the export proceeds recorded against it —
+    bank, PRC number, foreign-currency amount, rate and the BDT value at that rate, plus the R6.6 batch that posted
+    it. The PRC number is upper-cased as the mock did and unique *while it is on an invoice* (the bank batches split
+    one PRC over several invoices, so there is no global unique index), and removing an entry frees it again.
+  - **The shipping documents are columns, not JSON:** an export or deemed-export invoice (Mushak 4.1, zero-rated)
+    keeps its LC, bill of export, customs house, country, currency, foreign-currency value and exchange rate
+    (`numeric(18,6)`) on its own row, so what a bond register or a proceeds report needs is a `WHERE`, not a walk over
+    every invoice. `export_deemed` is the presence marker — NULL means a domestic sale — and two check constraints
+    keep the block coherent.
+  - **A deleted invoice keeps its number:** deleting stamps `deleted_at` and keeps the lines, because the mock handed
+    out the next number by counting the live array *and* the undo buffer. The number is unique in the database as
+    well (`S-MMYY####` for goods and exports, `SS-MMYY####` for services), so a race that slips past the application
+    check is a 409, not a 500; ids stay the mock's (`s<n>`), taken from `saleIdentity` inside the locked transaction.
+    An approval writes what it moves — `items.sold` goes with the invoice, in its transaction, and is taken back on
+    cancellation — and bulk approve answers 200 with `{done, skipped}`, not the 201 a `POST` defaults to, because
+    nothing is created there.
+  - **The rules are shared here too:** the native handlers call the mock's own `parseSale`, `lots`, `lotShortfall`,
+    `creditable`, `customerCredit`, `saleIdentity`, `periodLocked` and the register's facets and CSV columns through
+    the compat bundle, and both sides were held against the same contract suite — 676 checks with the routes served
+    natively, 676 again with the mock handlers serving them (which also proves the write-back: a draft, an approval,
+    an export header, a proceeds entry, a delete and an undo made through the mock's code all reached the tables).
+  - **What is still derived stays derived:** the credit a customer carries, what is returnable on an invoice, the
+    credit and debit notes that quote one, and the branch split and ledger that add up *every* document family read
+    the in-memory copies until the remaining families have tables (R5.3–R5.4). The module keeps those copies in step,
+    and the write-back adopts whatever a compat handler writes — including a delete, which it reads as "this invoice
+    is in the undo buffer now" and stamps exactly as the native delete does.
+  - **A purchase is two tables, and an import is queryable:** the header carries the money, the two totals only a
+    purchase has (`tti`, the total tax incidence, and `rebate`, the input tax credit claimable in Mushak 9.1) and its
+    own history; `purchase_lines` holds the printed lines in order with `rebateable` and `vds` per line. The Bill of
+    Entry an import clears — its number and date, LC, customs house, origin, C&F firm, the bonded flag and the own UD
+    number — is columns of the document's row (`boe_no` is the presence marker), and every import line keeps its duty
+    breakdown as columns: the assessable value, CD, RD, AIT and AT with their rates, plus what a bonded (IM-7) entry
+    left foregone. What the R6.4 bond register and the R6.5 drawback claims report is a `WHERE` and a `SUM` over
+    those columns, not a walk over every document in memory.
+  - **The same discipline as the invoices:** numbers unique in the database as well (`P-MMYY####`, `PS-MMYY####` for
+    services), deleting stamps `deleted_at` and keeps the lines so a deleted draft's number stays retired, ids from
+    `purchaseIdentity` inside the locked transaction, `items.purchased` written with an approval and taken back on
+    cancellation, bulk approve answering 200 with `{done, skipped}`, and a goods purchase that cannot become a
+    service one (409). The rules are the mock's own (`parsePurchase` — the vendor decides between the local, the
+    service and the import schema — `buildPurchaseFields`, `purchaseCategoryRule`, `returnable`, the register's
+    facets and CSV columns) through the compat bundle, and both sides were held against the same contract suite:
+    676 checks natively, 676 again with the mock handlers serving them (which also proved the write-back for an
+    import: a compat-created BoE reached the table with its duty columns and the header's `tti` and `rebate`).
+  - **Both note families are one table:** `kind` tells a credit note (goods a customer returns against a sales
+    invoice — the sold quantity and the output VAT come down) from a debit note (goods returned to a vendor against a
+    purchase — the purchased quantity comes down and the input tax credit is reversed), because the two registers,
+    the two "what is still returnable" answers and the two sides of a VAT return read them the same way. The document
+    a note was raised against is `source_id` and the party is `party_id`; the response names them by kind, as the
+    mock's two shapes do. The two totals only a debit note has (`tti`, `rebate`), a line's `sold_qty` /
+    `purchased_qty` and its debit-only totals are NULL on the other side, and check constraints say so.
+  - **A deleted draft keeps its row:** notes have no undo and the mock removed one from its array for good, but its
+    id counter had moved on and its number lives on in the audit trail — so the row is stamped rather than dropped,
+    which is what stops a later note taking the same id, while the next number still skips the deleted draft's. Ids
+    come from the state's own counter, claimed inside the locked transaction and separately from the identity, so a
+    debit note refused for want of stock consumes no id.
+  - **An approval writes what it moves:** a credit note takes `items.sold` down, a debit note `items.purchased`, each
+    with the note, in its transaction, and reversed on cancellation. Approving a debit note needs the goods still on
+    hand (422 while saving, 409 when approving a draft), and cancelling a credit note needs them still on hand too,
+    because they leave the branch again. The rules are the mock's own (`buildCredit` / `buildDebit` — the source
+    document has to exist and still be approved, the note cannot predate it, the period has to be open, every line
+    has to be returnable and priced pro rata — plus the identities, the approve / cancel / stock / delete rules and
+    both registers' specs and CSV columns) through the compat bundle, and both sides were held against the same
+    contract suite: 676 checks natively, 676 again with the mock handlers serving them (which also proved the
+    write-back: a compat-raised note reached the table with its kind, its source, its party and its lines, its
+    approval moved `items.sold`, and its delete stamped the row while the next note took a higher id).
+  - **Tests:** `api_native.py` 306 checks (+159 over the pre-R5.3 147: a stock draft is a row with its lines and moves no stock, approving it moves
+    the branch split the still-unported endpoints derive in memory, cancelling gives the stock back, a write-off
+    reaches `items.damage` and is taken back, editing a draft replaces the line rows, deleting one removes them and
+    retires its number, a create that cannot be approved leaves no row, the database refusing a duplicate document
+    number, a stale instance refusing a native document write during a deploy overlap — and a **second upgrade drill**: the database is rewritten into its pre-R5.3 shape, the API restarted, and
+    the same documents, lines, registers and derived stock are required back; then the sales invoices the same way — a
+    draft is a row with its line and moves no stock, approving moves the branch split, `items.sold` and the ledger
+    that still adds up every document, cancelling gives both back and stores the reason on the row, the history
+    travels with the row, editing replaces the line rows in the order they are printed, deleting stamps the row and
+    keeps its lines so the next invoice takes a new number and the undo clears the stamp, an export invoice keeps its
+    LC, country and FC value as columns, its proceeds are rows with the PRC upper-cased and the BDT at the rate
+    entered (a duplicate PRC or more than the outstanding FC value is a 422, removing one frees the number), a service
+    sale is numbered in its own series and moves no stock, bulk approve reports what it skipped, the snapshot carries
+    no sales collection, the database refuses a duplicate invoice number — and a **third upgrade drill**: the database
+    is rewritten into its pre-R5.3 shape (invoices, lines and proceeds entries inside `compat_state`, the deleted
+    drafts back in its undo buffer, the three tables empty), the API restarted, and the same rows, registers, export
+    headers, proceeds entries and derived stock are required back, with an invoice deleted before the upgrade still
+    undoable afterwards; then the purchases the same way — a draft is a row with its line and moves no stock,
+    approving moves the branch split, `items.purchased` and the ledger, cancelling takes the stock back out and
+    stores the reason, editing replaces the line rows in order, deleting stamps the row and keeps its lines so the
+    next document takes a new number and the undo clears the stamp, a goods purchase refuses to become a service one,
+    an import keeps its Bill of Entry and every line's duty as columns (with the bonded demo entries keeping their
+    duty foregone), a service purchase is numbered in its own series and moves no stock, bulk approve reports what it
+    skipped, what a debit note may still return is served from those rows, the snapshot carries no purchases
+    collection, the database refuses a duplicate document number — and a **fourth upgrade drill**: the database is
+    rewritten into its pre-R5.3 shape (documents, lines, Bills of Entry and duty breakdowns inside `compat_state`,
+    the deleted drafts back in its undo buffer, the two tables empty), the API restarted, and the same rows, three
+    registers row for row, BoEs, duty columns and derived stock are required back, with a document deleted before
+    the upgrade still undoable afterwards; then the notes the same way — a credit note is raised against an approved
+    invoice and priced pro rata, a draft moves no stock, approving brings the goods back and takes `items.sold` down
+    with the branch split, the ledger and the invoice's returnable quantity following, cancelling sends the goods out
+    again and stores the reason, editing replaces the line rows, a note cannot move to another invoice, returning more
+    than the document sold or bought is a 422, a note against a draft invoice is a 422, deleting stamps the row and
+    keeps its lines so the next note takes a new id and a new number; and on the debit side `tti` and `rebate` are
+    columns of its row, a return the branch no longer holds is a 409, approving takes `items.purchased` down, a
+    service purchase has no goods to return, the snapshot carries neither collection, the database refuses a duplicate
+    note number — and a **fifth upgrade drill**: both collections with their lines back inside `compat_state`, the two
+    tables empty, the API restarted, and the same notes, lines and registers row for row required back, with a note
+    deleted before the upgrade staying deleted while its id and number stay retired). Contract unchanged: 676 checks /
+    226 endpoints.
+  - **Next:** the remaining document families (production — BOMs, work orders, batches — and opening entries), and
+    then the derived stock itself, the branch split and the ledger, which become relational once every document is a
+    row (R5.4).
+
 Every menu entry of the plan is now live; unknown URLs still open a *Planned* page that links back to the legacy RBS VAT screen.
 
 All data is **realistic mock data**, served from `src/app/api/v1/*` (Next route handlers) through a typed client (`src/lib/api/client.ts`). ESLint stops components from importing the mock directly. On this branch the same `/api/v1` contract is also served by the **NestJS + PostgreSQL** API in `api/`: build and run with `API_UPSTREAM=http://127.0.0.1:4000` and no component changes are needed (see *Backend (R5)* below).

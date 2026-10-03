@@ -1,0 +1,105 @@
+CREATE TABLE "sale_lines" (
+	"sale_id" text NOT NULL,
+	"ord" integer NOT NULL,
+	"item_id" text NOT NULL,
+	"name" text NOT NULL,
+	"hs_code" text NOT NULL,
+	"uom" text NOT NULL,
+	"qty" numeric(18, 3) NOT NULL,
+	"price" numeric(18, 2) NOT NULL,
+	"sd_rate" numeric(7, 2) NOT NULL,
+	"vat_rate" numeric(7, 2) NOT NULL,
+	"subtotal" numeric(18, 2) NOT NULL,
+	"sd" numeric(18, 2) NOT NULL,
+	"vat" numeric(18, 2) NOT NULL,
+	"total" numeric(18, 2) NOT NULL,
+	"batch_id" text,
+	"batch_no" text,
+	CONSTRAINT "sale_lines_sale_id_ord_pk" PRIMARY KEY("sale_id","ord")
+);
+--> statement-breakpoint
+CREATE TABLE "sale_realisations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"sale_id" text NOT NULL,
+	"ord" integer NOT NULL,
+	"date" date NOT NULL,
+	"bank" text NOT NULL,
+	"prc_no" text NOT NULL,
+	"fc_amount" numeric(18, 2) NOT NULL,
+	"rate" numeric(18, 6) NOT NULL,
+	"bdt" numeric(18, 2) NOT NULL,
+	"note" text,
+	"by" text NOT NULL,
+	"at" timestamp (3) with time zone NOT NULL,
+	"batch_id" text
+);
+--> statement-breakpoint
+CREATE TABLE "sales" (
+	"id" text PRIMARY KEY NOT NULL,
+	"ord" serial NOT NULL,
+	"invoice_no" text NOT NULL,
+	"challan_no" text NOT NULL,
+	"issue_date" date NOT NULL,
+	"issue_time" text NOT NULL,
+	"process" text NOT NULL,
+	"category" text,
+	"branch_id" text NOT NULL,
+	"branch_name" text NOT NULL,
+	"customer_id" text NOT NULL,
+	"customer_name" text NOT NULL,
+	"customer_bin" text NOT NULL,
+	"customer_address" text NOT NULL,
+	"delivery_address" text NOT NULL,
+	"vehicle" text,
+	"mode" text NOT NULL,
+	"method" text NOT NULL,
+	"vds" boolean NOT NULL,
+	"subtotal" numeric(18, 2) NOT NULL,
+	"sd" numeric(18, 2) NOT NULL,
+	"vat" numeric(18, 2) NOT NULL,
+	"discount" numeric(18, 2) NOT NULL,
+	"net_total" numeric(18, 2) NOT NULL,
+	"paid" numeric(18, 2) NOT NULL,
+	"due" numeric(18, 2) NOT NULL,
+	"issued_by" text NOT NULL,
+	"designation" text NOT NULL,
+	"narration" text,
+	"created_at" timestamp (3) with time zone NOT NULL,
+	"updated_at" timestamp (3) with time zone,
+	"cancel_reason" text,
+	"history" jsonb,
+	"deleted_at" timestamp (3) with time zone,
+	"export_deemed" boolean,
+	"export_lc_no" text,
+	"export_lc_date" date,
+	"export_customs_house" text,
+	"export_country" text,
+	"export_bill_no" text,
+	"export_bill_date" text,
+	"export_shipping_address" text,
+	"export_cnf_firm" text,
+	"export_ud_no" text,
+	"export_ud_date" text,
+	"export_exp_no" text,
+	"export_currency" text,
+	"export_fc_value" numeric(18, 2),
+	"export_exchange_rate" numeric(18, 6),
+	"export_exporter_bond" text,
+	"export_own_ud_no" text,
+	"export_realisations" boolean DEFAULT false NOT NULL,
+	CONSTRAINT "sales_process_check" CHECK ("sales"."process" in ('Created','Approved','Cancelled')),
+	CONSTRAINT "sales_category_check" CHECK ("sales"."category" is null or "sales"."category" in ('goods','service')),
+	CONSTRAINT "sales_mode_check" CHECK ("sales"."mode" in ('Local','Foreign')),
+	CONSTRAINT "sales_method_check" CHECK ("sales"."method" in ('Bank','Cash','Cheque','Mobile','Transaction')),
+	CONSTRAINT "sales_export_check" CHECK (("sales"."export_deemed" is null and "sales"."export_lc_no" is null) or ("sales"."export_deemed" is not null and "sales"."export_lc_no" is not null)),
+	CONSTRAINT "sales_export_currency_check" CHECK ("sales"."export_currency" is null or "sales"."export_currency" in ('USD','EUR','GBP','BDT'))
+);
+--> statement-breakpoint
+CREATE INDEX "sale_lines_item_idx" ON "sale_lines" USING btree ("item_id");--> statement-breakpoint
+CREATE INDEX "sale_realisations_sale_idx" ON "sale_realisations" USING btree ("sale_id");--> statement-breakpoint
+CREATE INDEX "sale_realisations_prc_idx" ON "sale_realisations" USING btree ("prc_no");--> statement-breakpoint
+CREATE UNIQUE INDEX "sales_invoice_no_key" ON "sales" USING btree ("invoice_no");--> statement-breakpoint
+CREATE INDEX "sales_live_idx" ON "sales" USING btree ("created_at") WHERE "sales"."deleted_at" is null;--> statement-breakpoint
+CREATE INDEX "sales_issue_date_idx" ON "sales" USING btree ("issue_date");--> statement-breakpoint
+CREATE INDEX "sales_customer_idx" ON "sales" USING btree ("customer_id");--> statement-breakpoint
+CREATE INDEX "sales_branch_idx" ON "sales" USING btree ("branch_id");

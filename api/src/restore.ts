@@ -95,7 +95,7 @@ async function freePort(): Promise<number> {
   })
 }
 
-async function bootCheck(target: string, admin: { username: string; password: string } | null, sales: number, log: (m: string) => void): Promise<{ ok: boolean; detail: string }> {
+async function bootCheck(target: string, admin: { username: string; password: string } | null, docs: { sales: number; purchases: number }, log: (m: string) => void): Promise<{ ok: boolean; detail: string }> {
   const port = await freePort()
   const child: ChildProcess = spawn(process.execPath, [join(__dirname, "main.js")], {
     env: { ...process.env, DATABASE_URL: target, API_PORT: String(port), API_HOST: "127.0.0.1", BACKUPS: "off", DEMO_RESEED: "off", SESSION_SECRET: randomBytes(24).toString("hex") },
@@ -119,11 +119,13 @@ async function bootCheck(target: string, admin: { username: string; password: st
     const login = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ username: admin.username, password: admin.password }) })
     if (!login.ok) return { ok: false, detail: `sign-in as ${admin.username} failed: HTTP ${login.status}` }
     const cookie = (login.headers.getSetCookie?.() ?? [login.headers.get("set-cookie") ?? ""]).map((c) => c.split(";")[0]).join("; ")
-    const r = await fetch(`${base}/sales?category=all&pageSize=1`, { headers: { cookie } })
-    if (!r.ok) return { ok: false, detail: `GET /sales failed: HTTP ${r.status}` }
-    const page = (await r.json()) as { total?: number }
-    if (page.total !== sales) return { ok: false, detail: `GET /sales total ${page.total} ≠ ${sales} sales in the backup` }
-    log(`  signed in as ${admin.username}; /sales lists all ${sales} invoices`)
+    for (const [path, want] of [["sales", docs.sales], ["purchases", docs.purchases]] as const) {
+      const r = await fetch(`${base}/${path}?category=all&pageSize=1`, { headers: { cookie } })
+      if (!r.ok) return { ok: false, detail: `GET /${path} failed: HTTP ${r.status}` }
+      const page = (await r.json()) as { total?: number }
+      if (page.total !== want) return { ok: false, detail: `GET /${path} total ${page.total} ≠ ${want} ${path} in the backup` }
+    }
+    log(`  signed in as ${admin.username}; /sales lists all ${docs.sales} invoices, /purchases all ${docs.purchases}`)
     return { ok: true, detail: "health, sign-in and documents ok" }
   } finally {
     child.kill("SIGTERM")
@@ -229,8 +231,15 @@ export async function run(a: Args, log: (m: string) => void = console.log): Prom
   let boot: RestoreDrill["boot"] = "skipped"
   if (a.boot) {
     const admin = a.adminPassword ? (a.adminUser ? users.find((u) => u.username === a.adminUser) : users.find((u) => u.role === "admin" && u.active)) : undefined
-    const sales = ((payload.tables.compat_state?.[0] as { data?: { db?: { sales?: unknown[] } } } | undefined)?.data?.db?.sales ?? []).length
-    const r = await bootCheck(a.target, admin && a.adminPassword ? { username: admin.username, password: a.adminPassword } : null, sales, log)
+    // the documents the restored instance must list: their own tables since R5.3 (a stamped draft is not listed),
+    // the snapshot's arrays in a backup taken before that
+    const snapshotDb = (payload.tables.compat_state?.[0] as { data?: { db?: Record<string, unknown[]> } } | undefined)?.data?.db
+    const live = (table: string, collection: string) => {
+      const rows = payload.tables[table] as { deleted_at?: string | null }[] | undefined
+      return rows ? rows.filter((r) => !r.deleted_at).length : (snapshotDb?.[collection] ?? []).length
+    }
+    const r = await bootCheck(a.target, admin && a.adminPassword ? { username: admin.username, password: a.adminPassword } : null,
+      { sales: live("sales", "sales"), purchases: live("purchases", "purchases") }, log)
     boot = r.ok ? "ok" : "failed"
     if (!r.ok) mismatches.push(`boot: ${r.detail}`)
   }

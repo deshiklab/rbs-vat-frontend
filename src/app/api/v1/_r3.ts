@@ -7,8 +7,9 @@ import { csvResponse, delay, runQuery, toCSV, type QuerySpec } from "@/lib/mock/
 import { batchInput, batchReceiveInput, bomInput, cancelInput, creditNoteInput, productionConfigInput, saleInput, workOrderInput } from "@/lib/schemas"
 import type { AuditChange, Batch, BatchLine, Bom, BomRow, BomStatus, Consumption, CreditLine, CreditNote, HistoryEntry, Lot, Party, Sale, WorkOrder } from "@/lib/types"
 import { calcBom, calcCreditLine, round2, round4 } from "@/lib/vat"
-import { deny, json, problem, withAuth, zodProblem } from "./_lib"
-import { lockedConflict, lockedField } from "./_r4"
+import { deny, invalidRule, json, problem, ruleResponse, withAuth, zodErrors, zodProblem, type RuleProblem } from "./_lib"
+import { noteDiff, noteDraftRule } from "./_docs"
+import { lockedConflictProblem, lockedFieldRule } from "./_r4"
 
 type Ctx = { params: Promise<{ id: string }> }
 type Entity = "creditNote" | "bom" | "workOrder" | "batch"
@@ -39,32 +40,40 @@ export type SaleData = z.output<typeof saleInput>
  * Validates a sales-invoice body for every R3 variant. Foreign customers need export documents (zero-rated);
  * deemed exports (back-to-back LC) go to local customers; service sales use the sale-service list and move no stock.
  */
-export function parseSale(body: unknown, self?: Sale): Response | { data: SaleData; cust: Party; fields: ReturnType<typeof buildSaleFields> } {
+/** What a sale's lines become once priced: the fields buildSaleFields produces. */
+export type SaleFields = ReturnType<typeof buildSaleFields>
+
+/**
+ * Validates a sale body (goods, export / deemed export, or service) and prices it. R5.3: returns the rejection as
+ * data (`RuleProblem`) instead of a Response, so the API's native sale module raises the same 422/409 from the same
+ * rules — the mock's side turns it back into a Response with `ruleResponse`.
+ */
+export function parseSale(body: unknown, self?: Sale): RuleProblem | { data: SaleData; cust: Party; fields: SaleFields } {
   const parsed = saleInput.safeParse(body)
-  if (!parsed.success) return zodProblem(parsed.error)
+  if (!parsed.success) return invalidRule(zodErrors(parsed.error))
   const d = parsed.data
   const cust = db.customers.find((c) => c.id === d.customerId && c.active !== false)
-  if (!cust) return invalid({ customerId: ["unknown"] })
+  if (!cust) return invalidRule({ customerId: ["unknown"] })
   const service = d.category === "service"
-  if (self && service !== (self.category === "service")) return problem(409, "A goods sale cannot become a service sale (or vice versa).")
+  if (self && service !== (self.category === "service")) return { status: 409, title: "A goods sale cannot become a service sale (or vice versa)." }
   const bad = (service ? unknownSaleServices(d.lines) : unknownItems(d.lines, "Finished Goods")) ?? unknownBranch(d.branchId)
-  if (bad) return invalid(bad)
+  if (bad) return invalidRule(bad)
   if (service) {
-    if (cust.mode === "Foreign") return invalid({ customerId: ["foreignService"] })
+    if (cust.mode === "Foreign") return invalidRule({ customerId: ["foreignService"] })
     d.export = undefined
   } else {
-    if (cust.mode === "Foreign" && !d.export) return invalid({ export: ["exportRequired"] })
+    if (cust.mode === "Foreign" && !d.export) return invalidRule({ export: ["exportRequired"] })
     if (d.export) {
-      if (d.export.deemed && cust.mode === "Foreign") return invalid({ "export.deemed": ["deemedLocalOnly"] })
-      if (!d.export.deemed && cust.mode !== "Foreign") return invalid({ "export.deemed": ["exportForeignOnly"] })
-      if (d.export.lcDate > d.issueDate) return invalid({ "export.lcDate": ["lcAfterInvoice"] })
-      if (!d.export.deemed && d.export.billDate && d.export.billDate < d.issueDate) return invalid({ "export.billDate": ["beforeInvoice"] })
+      if (d.export.deemed && cust.mode === "Foreign") return invalidRule({ "export.deemed": ["deemedLocalOnly"] })
+      if (!d.export.deemed && cust.mode !== "Foreign") return invalidRule({ "export.deemed": ["exportForeignOnly"] })
+      if (d.export.lcDate > d.issueDate) return invalidRule({ "export.lcDate": ["lcAfterInvoice"] })
+      if (!d.export.deemed && d.export.billDate && d.export.billDate < d.issueDate) return invalidRule({ "export.billDate": ["beforeInvoice"] })
       // R6.5: our own UD / UP — must be on file and not settled yet (unless this invoice was already on it)
       const own = d.export.ownUdNo?.trim().toUpperCase()
       if (own) {
         const u = db.bondUds.find((x) => x.no.toUpperCase() === own)
-        if (!u) return invalid({ "export.ownUdNo": ["unknownUd"] })
-        if (u.settlement && self?.export?.ownUdNo?.toUpperCase() !== own) return invalid({ "export.ownUdNo": ["settledUd"] })
+        if (!u) return invalidRule({ "export.ownUdNo": ["unknownUd"] })
+        if (u.settlement && self?.export?.ownUdNo?.toUpperCase() !== own) return invalidRule({ "export.ownUdNo": ["settledUd"] })
       }
     }
     const errors: Record<string, string[]> = {}
@@ -73,9 +82,9 @@ export function parseSale(body: unknown, self?: Sale): Response | { data: SaleDa
       const b = db.batches.find((x) => x.id === l.batchId && x.process === "Approved")
       if (!b || !b.lines.some((bl) => bl.itemId === l.itemId && bl.receiveQty > 0)) errors[`lines.${i}.batchId`] = ["unknownBatch"]
     })
-    if (has(errors)) return invalid(errors)
+    if (has(errors)) return invalidRule(errors)
   }
-  const lock = lockedField(d.issueDate, "issueDate"); if (lock) return lock
+  const lock = lockedFieldRule(d.issueDate, "issueDate"); if (lock) return invalidRule(lock)
   return { data: d, cust, fields: buildSaleFields(d, cust) }
 }
 
@@ -146,15 +155,18 @@ export function creditable(s: Sale, excludeId?: string) {
   })
 }
 
-function buildCredit(body: unknown, excludeId?: string) {
+/** What `buildCredit` returns: every field of the note but the identity and the lifecycle the caller adds. */
+export type CreditFields = Omit<CreditNote, "id" | "no" | "process" | "createdAt" | "history">
+
+export function buildCredit(body: unknown, excludeId?: string): RuleProblem | { process: "Created" | "Approved"; fields: CreditFields } {
   const parsed = creditNoteInput.safeParse(body)
-  if (!parsed.success) return { error: zodProblem(parsed.error) }
+  if (!parsed.success) return invalidRule(zodErrors(parsed.error))
   const d = parsed.data
   const s = db.sales.find((x) => x.id === d.saleId)
-  if (!s) return { error: invalid({ saleId: ["unknown"] }) }
-  if (s.process !== "Approved") return { error: invalid({ saleId: ["notApproved"] }) }
-  if (d.issueDate < s.issueDate) return { error: invalid({ issueDate: ["beforeSale"] }) }
-  { const lock = lockedField(d.issueDate, "issueDate"); if (lock) return { error: lock } }
+  if (!s) return invalidRule({ saleId: ["unknown"] })
+  if (s.process !== "Approved") return invalidRule({ saleId: ["notApproved"] })
+  if (d.issueDate < s.issueDate) return invalidRule({ issueDate: ["beforeSale"] })
+  { const lock = lockedFieldRule(d.issueDate, "issueDate"); if (lock) return invalidRule(lock) }
   const avail = creditable(s, excludeId)
   const errors: Record<string, string[]> = {}
   const lines: CreditLine[] = []
@@ -167,8 +179,8 @@ function buildCredit(body: unknown, excludeId?: string) {
     const c = calcCreditLine(src, l.qty * (src.qty / r.soldQty))
     lines.push({ itemId: r.itemId, name: r.name, hsCode: r.hsCode, uom: r.uom, soldQty: r.soldQty, qty: l.qty, price: src.price, sdRate: src.sdRate, vatRate: src.vatRate, ...c })
   })
-  if (has(errors)) return { error: invalid(errors) }
-  if (!lines.length) return { error: invalid({ lines: ["atLeastOneLine"] }) }
+  if (has(errors)) return invalidRule(errors)
+  if (!lines.length) return invalidRule({ lines: ["atLeastOneLine"] })
   const sum = (k: "subtotal" | "sd" | "vat" | "total") => round2(lines.reduce((a, l) => a + l[k], 0))
   return {
     process: d.process,
@@ -177,12 +189,12 @@ function buildCredit(body: unknown, excludeId?: string) {
       customerId: s.customerId, customerName: s.customerName, customerBin: s.customerBin, customerAddress: s.customerAddress, branchId: s.branchId, branchName: s.branchName,
       issueDate: d.issueDate, issueTime: d.issueTime, reason: d.reason, note: d.note || undefined, issuedBy: d.issuedBy, designation: d.designation, lines,
       subtotal: sum("subtotal"), sd: sum("sd"), vat: sum("vat"), total: sum("total"),
-    } satisfies Partial<CreditNote>,
+    } satisfies CreditFields as CreditFields,
   }
 }
 
 /** Approved return: goods come back into the selling branch (sold quantity goes down). Service lines move no stock. */
-function postCredit(n: CreditNote, sign: 1 | -1) {
+export function postCredit(n: CreditNote, sign: 1 | -1) {
   for (const l of n.lines) { const it = db.items.find((i) => i.id === l.itemId); if (it) it.sold = round2(it.sold - sign * l.qty) }
 }
 function approveCredit(n: CreditNote, by: string) {
@@ -191,37 +203,92 @@ function approveCredit(n: CreditNote, by: string) {
   addHistory("creditNote", n, by, "approved")
 }
 
-const cnSpec: QuerySpec<CreditNote> = {
+/**
+ * A new credit note's identity: the next id in the `cn` series (the counter lives in the state, because a deleted
+ * note leaves no row behind) and the next CN-MMYY#### — which the audit trail takes part in, so a deleted draft's
+ * number is not reused either. Claimed separately, so a create refused after this point consumes nothing.
+ */
+export function creditIdentity(issueDate: string) {
+  return { id: `cn${db.seq.creditNote + 1}`, no: nextNo("CN", "creditNote", db.creditNotes, issueDate) }
+}
+export const claimCreditId = () => { db.seq.creditNote += 1 }
+
+/** Approving needs a draft, a sales invoice that is still approved, and an open tax period. */
+export function creditApproveRule(n: CreditNote): RuleProblem | undefined {
+  if (n.process !== "Created") return { status: 409, title: `Cannot approve — ${n.no} is ${n.process}.` }
+  const s = db.sales.find((x) => x.id === n.saleId)
+  if (!s || s.process !== "Approved") return { status: 409, title: `Sales invoice ${n.saleNo} is no longer approved.` }
+  return lockedConflictProblem(n.issueDate, n.no) ?? undefined
+}
+
+/**
+ * Cancelling: a note is never cancelled twice, the reason is mandatory, an approved one needs an open period — and
+ * the goods it brought back must still be on hand, because they leave the branch again.
+ */
+export function creditCancelRule(n: CreditNote, reason: string): RuleProblem | { reason: string } {
+  if (n.process === "Cancelled") return { status: 409, title: `${n.no} is already cancelled.` }
+  const parsed = cancelInput.safeParse({ reason })
+  if (!parsed.success) return invalidRule(zodErrors(parsed.error))
+  if (n.process === "Approved") {
+    const lock = lockedConflictProblem(n.issueDate, n.no); if (lock) return lock
+    const short = stockShortfall(n.lines, n.branchId)
+    if (short) return { status: 409, title: `The returned goods have already been used — ${short.detail}`, errors: short.errors }
+  }
+  return { reason: parsed.data.reason }
+}
+
+/** A credit note stays with the invoice it was raised against — moving it means raising a new one. */
+export function creditMovedRule(n: CreditNote, saleId: string): RuleProblem | undefined {
+  return saleId !== n.saleId
+    ? { status: 409, title: "A credit note cannot move to another sales invoice — create a new one." } : undefined
+}
+
+/** Only a draft may be deleted; its number lives on in the audit trail. */
+export function creditDeleteRule(n: CreditNote): RuleProblem | undefined {
+  return n.process !== "Created"
+    ? { status: 409, title: `Only drafts can be deleted — cancel ${n.no} instead.` } : undefined
+}
+
+export const creditSpec: QuerySpec<CreditNote> = {
   search: (n) => `${n.no} ${n.saleNo} ${n.challanNo} ${n.customerName} ${n.customerBin} ${n.lines.map((l) => l.name).join(" ")}`,
   dateField: "issueDate",
   facets: { process: (n) => n.process, reason: (n) => n.reason, customer: (n) => n.customerId, branch: (n) => n.branchId },
   totals: ["subtotal", "sd", "vat", "total"],
 }
 
+/** The register's `?sale=` filter: the notes of one invoice, taken out of the params before the query runs. */
+export const creditSourceFilter = (params: URLSearchParams, src: CreditNote[]) => {
+  const sale = params.get("sale")
+  params.delete("sale")
+  return sale ? src.filter((n) => n.saleId === sale) : src
+}
+
+export const creditCsvColumns: { key: string; label: string; get?: (n: CreditNote) => unknown }[] = [
+  { key: "issueDate", label: "Date" }, { key: "no", label: "Credit Note No" }, { key: "saleNo", label: "Sales Invoice" }, { key: "challanNo", label: "Challan No" },
+  { key: "customerName", label: "Customer" }, { key: "customerBin", label: "BIN" }, { key: "reason", label: "Reason" }, { key: "subtotal", label: "Value" },
+  { key: "sd", label: "SD" }, { key: "vat", label: "VAT" }, { key: "total", label: "Total" }, { key: "process", label: "Process" },
+]
+
+export const creditFacetLabels = () => ({ customer: Object.fromEntries(db.customers.map((c) => [c.id, c.name])), branch: branchLabels() })
+
 export function creditListRoutes() {
   const GET = withAuth(null, async (req) => {
     const sp = new URL(req.url).searchParams
     if (!sp.get("sort")) sp.set("sort", "createdAt.desc")
-    const sale = sp.get("sale"); sp.delete("sale")
-    const r = runQuery(sale ? db.creditNotes.filter((n) => n.saleId === sale) : db.creditNotes, sp, cnSpec)
-    if (sp.get("format") === "csv") {
-      return csvResponse(toCSV(r.all, [
-        { key: "issueDate", label: "Date" }, { key: "no", label: "Credit Note No" }, { key: "saleNo", label: "Sales Invoice" }, { key: "challanNo", label: "Challan No" },
-        { key: "customerName", label: "Customer" }, { key: "customerBin", label: "BIN" }, { key: "reason", label: "Reason" }, { key: "subtotal", label: "Value" },
-        { key: "sd", label: "SD" }, { key: "vat", label: "VAT" }, { key: "total", label: "Total" }, { key: "process", label: "Process" },
-      ]), `credit-notes-${new Date().toISOString().slice(0, 10)}.csv`)
-    }
+    const r = runQuery(creditSourceFilter(sp, db.creditNotes), sp, creditSpec)
+    if (sp.get("format") === "csv")
+      return csvResponse(toCSV(r.all, creditCsvColumns), `credit-notes-${new Date().toISOString().slice(0, 10)}.csv`)
     await delay()
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { all, ...page } = r
-    return json({ ...page, facetLabels: { customer: Object.fromEntries(db.customers.map((c) => [c.id, c.name])), branch: branchLabels() } })
+    return json({ ...page, facetLabels: creditFacetLabels() })
   })
   const POST = withAuth("doc.create", async (req, _ctx, user) => {
     const r = buildCredit(await req.json().catch(() => ({})))
-    if (r.error) return r.error
+    if ("status" in r) return ruleResponse(r)
     if (r.process === "Approved") { const no = deny(user, "doc.approve"); if (no) return no }
-    const n: CreditNote = { ...r.fields!, id: `cn${db.seq.creditNote + 1}`, no: nextNo("CN", "creditNote", db.creditNotes, r.fields!.issueDate), process: "Created", createdAt: new Date().toISOString(), history: [] }
-    db.seq.creditNote += 1
+    const n: CreditNote = { ...r.fields!, ...creditIdentity(r.fields!.issueDate), process: "Created", createdAt: new Date().toISOString(), history: [] }
+    claimCreditId()
     addHistory("creditNote", n, user.name, "created")
     if (r.process === "Approved") approveCredit(n, user.name)
     db.creditNotes.push(n)
@@ -242,17 +309,14 @@ export function creditDocRoutes() {
     const { id } = await params
     const n = find(id)
     if (!n) return problem(404, "Credit note not found")
-    if (n.process !== "Created") return problem(409, `Only drafts can be edited — ${n.no} is ${n.process}.`)
+    const draft = noteDraftRule(n); if (draft) return ruleResponse(draft)
     const r = buildCredit(await req.json().catch(() => ({})), n.id)
-    if (r.error) return r.error
+    if ("status" in r) return ruleResponse(r)
     if (r.process === "Approved") { const no = deny(user, "doc.approve"); if (no) return no }
-    if (r.fields!.saleId !== n.saleId) return problem(409, "A credit note cannot move to another sales invoice — create a new one.")
+    const moved = creditMovedRule(n, r.fields.saleId); if (moved) return ruleResponse(moved)
     const before = structuredClone(n)
     Object.assign(n, r.fields)
-    const changes = diff(before, n, ["issueDate", "issueTime", "reason", "note", "subtotal", "vat", "total"])
-    const sig = (d: CreditNote) => d.lines.map((l) => `${l.name} × ${l.qty}`).join("; ")
-    if (sig(before) !== sig(n)) changes.push({ field: "lines", from: sig(before), to: sig(n) })
-    addHistory("creditNote", n, user.name, "edited", undefined, changes)
+    addHistory("creditNote", n, user.name, "edited", undefined, noteDiff(before, n))
     if (r.process === "Approved") approveCredit(n, user.name)
     return json(n)
   })
@@ -263,28 +327,18 @@ export function creditDocRoutes() {
     const body = (await req.json().catch(() => ({}))) as { process?: string; reason?: string }
     if (body.process === "Approved") {
       const no = deny(user, "doc.approve"); if (no) return no
-      if (n.process !== "Created") return problem(409, `Cannot approve — ${n.no} is ${n.process}.`)
-      const s = db.sales.find((x) => x.id === n.saleId)
-      if (!s || s.process !== "Approved") return problem(409, `Sales invoice ${n.saleNo} is no longer approved.`)
-      const lock = lockedConflict(n.issueDate, n.no); if (lock) return lock
+      const rule = creditApproveRule(n); if (rule) return ruleResponse(rule)
       approveCredit(n, user.name)
       return json(n)
     }
     if (body.process === "Cancelled") {
       const no = deny(user, "doc.cancel"); if (no) return no
-      if (n.process === "Cancelled") return problem(409, `${n.no} is already cancelled.`)
-      const r = cancelInput.safeParse({ reason: body.reason ?? "" })
-      if (!r.success) return zodProblem(r.error)
-      if (n.process === "Approved") {
-        const lock = lockedConflict(n.issueDate, n.no); if (lock) return lock
-        // the returned goods leave again — they must still be on hand
-        const short = stockShortfall(n.lines, n.branchId)
-        if (short) return problem(409, `The returned goods have already been used — ${short.detail}`)
-        postCredit(n, -1)
-      }
+      const r = creditCancelRule(n, body.reason ?? "")
+      if ("status" in r) return ruleResponse(r)
+      if (n.process === "Approved") postCredit(n, -1) // the returned goods leave again
       n.process = "Cancelled"
-      n.cancelReason = r.data.reason
-      addHistory("creditNote", n, user.name, "cancelled", r.data.reason)
+      n.cancelReason = r.reason
+      addHistory("creditNote", n, user.name, "cancelled", r.reason)
       return json(n)
     }
     return problem(400, "process must be Approved or Cancelled")
@@ -293,7 +347,7 @@ export function creditDocRoutes() {
     const { id } = await params
     const i = db.creditNotes.findIndex((x) => x.id === id)
     if (i < 0) return problem(404, "Credit note not found")
-    if (db.creditNotes[i].process !== "Created") return problem(409, `Only drafts can be deleted — cancel ${db.creditNotes[i].no} instead.`)
+    const gone = creditDeleteRule(db.creditNotes[i]); if (gone) return ruleResponse(gone)
     const [n] = db.creditNotes.splice(i, 1)
     addHistory("creditNote", n, user.name, "deleted")
     return json({ ok: true })

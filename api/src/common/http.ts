@@ -10,6 +10,20 @@ export class Problem extends HttpException {
   }
 }
 
+/**
+ * The unique index a write collided with, or null when the error is something else. Drizzle wraps the driver error
+ * (`DrizzleQueryError: Failed query: …`), so the PostgreSQL code has to be read from the cause — without this every
+ * duplicate that the application checks did not catch (two requests at once, an undo against a record created since)
+ * would reach the user as a 500 instead of the 422 the form validation answers with.
+ */
+export function uniqueViolation(e: unknown): string | null {
+  for (const x of [e, (e as { cause?: unknown } | null)?.cause]) {
+    const c = x as { code?: string; constraint_name?: string; constraint?: string } | null | undefined
+    if (c?.code === "23505") return String(c.constraint_name ?? c.constraint ?? "")
+  }
+  return null
+}
+
 export const zodErrors = (e: ZodError, fallback = "_") => {
   const errors: Record<string, string[]> = {}
   for (const i of e.issues) (errors[i.path.join(".") || fallback] ??= []).push(i.message)

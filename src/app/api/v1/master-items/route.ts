@@ -1,3 +1,3 @@
-import { masterListRoutes } from "../_r2"
+import { masterListRoutes } from "../_items"
 
 export const { GET, POST } = masterListRoutes()

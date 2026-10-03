@@ -22,7 +22,7 @@ import type {
 import type { User } from "@/lib/auth/roles"
 import { round2 } from "@/lib/vat"
 import { sdEligible, sdExportLink } from "@/lib/sd-export"
-import { deny, json, problem, withAuth, zodProblem } from "./_lib"
+import { deny, json, problem, withAuth, zodProblem, type RuleProblem } from "./_lib"
 
 type Ctx = { params: Promise<{ id: string }> }
 const invalid = (errors: Record<string, string[]>) => problem(422, "Validation failed", errors)
@@ -33,15 +33,28 @@ const CURRENT = periodOf(TODAY)
 
 /* ── Period lock (Mushak 9.1 submitted) & accounting close ─────────────── */
 
+/** The submitted Mushak 9.1 return that locks a date's tax period, if any. */
+export const periodLocked = (date: string) => lockingReturn(db, date)
+/** R5.3: the lock as data — the field error, and the 409's title — so the native modules raise the same problem. */
+export const lockedFieldRule = (date: string, field: string) => (periodLocked(date) ? { [field]: ["periodLocked"] } : null)
+export function lockedConflictRule(date: string, no: string) {
+  const r = periodLocked(date)
+  return r ? `Tax period ${periodLabel(r.period)} is locked — its Mushak 9.1 return was submitted on ${r.submissionDate}. ${no} cannot change; record a correction in the current period (credit/debit note or VAT adjustment).` : null
+}
 /** 422 field error when a date falls in a tax period whose return has been submitted. */
 export function lockedField(date: string, field: string) {
-  const r = lockingReturn(db, date)
-  return r ? invalid({ [field]: ["periodLocked"] }) : null
+  const errors = lockedFieldRule(date, field)
+  return errors ? invalid(errors) : null
+}
+/** The lock as a 409 rule problem (R5.3) — what both runtimes raise for approve / cancel in a locked period. */
+export function lockedConflictProblem(date: string, no: string): RuleProblem | null {
+  const title = lockedConflictRule(date, no)
+  return title ? { status: 409, title } : null
 }
 /** 409 when a document's tax period is locked (approve / cancel of an existing document). */
 export function lockedConflict(date: string, no: string) {
-  const r = lockingReturn(db, date)
-  return r ? problem(409, `Tax period ${periodLabel(r.period)} is locked — its Mushak 9.1 return was submitted on ${r.submissionDate}. ${no} cannot change; record a correction in the current period (credit/debit note or VAT adjustment).`) : null
+  const title = lockedConflictRule(date, no)
+  return title ? problem(409, title) : null
 }
 const closed = (date: string) => !!db.accountingConfig.closedUpTo && date <= db.accountingConfig.closedUpTo
 

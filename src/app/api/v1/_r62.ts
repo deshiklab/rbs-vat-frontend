@@ -18,6 +18,8 @@ import type {
 import type { User } from "@/lib/auth/roles"
 import { round2 } from "@/lib/vat"
 import { badUnit } from "@/lib/mock/units"
+import { buildItem, newItemId } from "./_items"
+import { newPartyId } from "./_parties"
 
 /* ── UD / UP register ─────────────────────────────────────────────────────── */
 
@@ -152,11 +154,8 @@ export function bulkImport(entity: ImportEntity, rows: Record<string, unknown>[]
       if (badUnit(d.unit)) { issues.push({ row, field: "unit", message: "unknownUnit" }); return }
       if (db.items.some((x) => x.sku.toLowerCase() === key)) { duplicates++; return }
       toCreate.push(() => {
-        const it: Item = {
-          id: `i${db.items.length + 1}-${Date.now().toString(36)}${i}`, ...d, masterItem: d.name.split(" ")[0], brand: "Local",
-          costPrice: d.purchasePrice ? Math.round(d.purchasePrice * 112) / 100 : Math.round(d.salePrice * 78) / 100,
-          opening: 0, purchased: 0, prodReceive: 0, prodIssue: 0, sold: 0, damage: 0,
-        }
+        // the same stored shape the item form produces (R5.2: shared with the native handlers through _items.ts)
+        const it = buildItem(d, d.name.split(" ")[0], newItemId(String(i)))
         db.items.push(it)
         audit({ entity: "item", entityId: it.id, ref: `${it.sku} · ${it.name}`, note: "Bulk import" })
       })
@@ -175,7 +174,7 @@ export function bulkImport(entity: ImportEntity, rows: Record<string, unknown>[]
       toCreate.push(() => {
         const { exporterType, bondLicenseNo, bondLicenseExpiry, associationNo, ...rest } = d
         const p: Party = {
-          ...rest, name, id: `${k[0]}${coll.length + db.trash.length + 1}-${Date.now().toString(36)}${i}`, kind: k,
+          ...rest, name, id: newPartyId(k, String(i)), kind: k,
           bin: d.mode === "Non-registered" && d.bin && !d.bin.startsWith("NID ") ? `NID ${d.bin}` : d.bin,
           country: d.mode === "Foreign" ? d.country : undefined,
           exporterType: exporterType || undefined, bondLicenseNo: bondLicenseNo || undefined, bondLicenseExpiry: bondLicenseExpiry || undefined, associationNo: associationNo || undefined,

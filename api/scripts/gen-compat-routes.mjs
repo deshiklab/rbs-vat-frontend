@@ -11,6 +11,18 @@ export const NATIVE = [
   "auth/login", "auth/logout", "me", "me/password", "me/preferences", "me/views",
   "users", "users/[id]", "users/[id]/reset-password", "company", "audit", "audit/verify", "tariff", "units", "units/[id]",
   "backups", "backups/[id]", "backups/[id]/verify",
+  // R5.2: customers and vendors live in the `parties` table
+  "customers", "customers/[id]", "customers/[id]/restore", "vendors", "vendors/[id]", "vendors/[id]/restore",
+  // R5.2: SKUs and master items live in `items` / `master_items` (the stock ledger and the branch split stay here)
+  "items", "items/[id]", "master-items", "master-items/[id]",
+  // R5.3: stock transfers and damage entries live in `stock_documents` (the ledger and the branch split derive
+  // from every movement document, so they stay here until the rest have tables)
+  "transfers", "transfers/[id]", "damage", "damage/[id]",
+  // R5.3: sales invoices live in `sales` (their lines in `sale_lines`, their proceeds entries in
+  // `sale_realisations`); the branch stock, the ledger and the VAT returns still derive from every document
+  "sales", "sales/[id]", "sales/[id]/creditable", "sales/[id]/realisations", "sales/[id]/restore", "sales/bulk",
+  "purchases", "purchases/[id]", "purchases/[id]/restore", "purchases/[id]/returnable", "purchases/bulk",
+  "credit-notes", "credit-notes/[id]", "debit-notes", "debit-notes/[id]",
 ]
 
 const found = []

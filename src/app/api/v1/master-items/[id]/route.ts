@@ -1,3 +1,3 @@
-import { masterDocRoutes } from "../../_r2"
+import { masterDocRoutes } from "../../_items"
 
 export const { GET, PUT } = masterDocRoutes()

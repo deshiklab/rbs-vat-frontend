@@ -8,11 +8,24 @@ export const json = (data: unknown, init?: ResponseInit) => Response.json(data, 
 /** RFC 9457 problem+json — the error shape the Symfony API will return */
 export const problem = (status: number, title: string, errors?: Record<string, string[]>) =>
   Response.json({ type: "about:blank", title, status, errors }, { status, headers: { "content-type": "application/problem+json" } })
-export const zodProblem = (e: ZodError) => {
+/**
+ * A rejection as data: the status, title and field → codes both sides answer with. Shared rules return this (R5.3)
+ * so the mock and the API's native modules cannot drift: the mock turns it into a Web Response, Nest into an
+ * RFC 9457 problem.
+ */
+export type RuleProblem = { status: 400 | 409 | 422; title: string; errors?: Record<string, string[]> }
+/** The mock's side of a RuleProblem. */
+export const ruleResponse = (p: RuleProblem) => problem(p.status, p.title, p.errors)
+/** A 422 "Validation failed" as data. */
+export const invalidRule = (errors: Record<string, string[]>): RuleProblem => ({ status: 422, title: "Validation failed", errors })
+
+/** zod issues → field → codes (R5.3: data, so the API's native modules answer with the same 422 body). */
+export const zodErrors = (e: ZodError): Record<string, string[]> => {
   const errors: Record<string, string[]> = {}
   for (const i of e.issues) (errors[i.path.join(".") || "_"] ??= []).push(i.message)
-  return problem(422, "Validation failed", errors)
+  return errors
 }
+export const zodProblem = (e: ZodError) => problem(422, "Validation failed", zodErrors(e))
 
 /** 403 problem if the user lacks `perm`, else null. */
 export const deny = (user: User, perm: Permission) =>
